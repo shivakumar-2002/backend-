@@ -21,28 +21,20 @@ if (isCloudinaryConfigured) {
   });
 }
 
-// Local storage fallback setup
+// Local storage fallback setup (wrapped in try-catch for serverless environments)
 const uploadsDir = path.resolve(__dirname, '../../public/uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
+try {
+  if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+  }
+} catch (err) {
+  // Gracefully ignored on read-only serverless platforms like Vercel
+  console.warn('Local uploads directory not writable or running in serverless environment:', err.message);
 }
 
-// Multer memory or disk storage
-const storage = isCloudinaryConfigured
-  ? multer.memoryStorage()
-  : multer.diskStorage({
-      destination: (req, file, cb) => {
-        cb(null, uploadsDir);
-      },
-      filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-        const ext = path.extname(file.originalname).toLowerCase();
-        cb(null, `jewel-${uniqueSuffix}${ext}`);
-      },
-    });
-
+// Multer memory storage - works seamlessly across local, VPS, Docker, and Serverless (Vercel)
 export const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: {
     fileSize: 10 * 1024 * 1024, // 10MB limit
   },
@@ -50,7 +42,7 @@ export const upload = multer({
     const allowed = /jpeg|jpg|png|webp|gif/;
     const ext = path.extname(file.originalname).toLowerCase();
     const mime = file.mimetype.toLowerCase();
-    if (allowed.test(ext) && (mime.startsWith('image/'))) {
+    if (allowed.test(ext) || mime.startsWith('image/')) {
       return cb(null, true);
     }
     cb(new Error('Only valid image files (JPG, PNG, WEBP, GIF) are allowed.'));
@@ -58,6 +50,7 @@ export const upload = multer({
 });
 
 export const uploadImageToStorage = async (file) => {
+  // 1. Primary: Cloudinary Cloud CDN if credentials exist
   if (isCloudinaryConfigured) {
     return new Promise((resolve, reject) => {
       const folder = process.env.CLOUDINARY_FOLDER || 'harihara_jewellery';
@@ -79,15 +72,38 @@ export const uploadImageToStorage = async (file) => {
     });
   }
 
-  // Local fallback
-  return {
-    imageUrl: `/uploads/${file.filename}`,
-    publicId: file.filename,
-  };
+  // 2. Secondary: Local disk storage if filesystem is writable
+  try {
+    if (!fs.existsSync(uploadsDir)) {
+      fs.mkdirSync(uploadsDir, { recursive: true });
+    }
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    const ext = (path.extname(file.originalname) || '.png').toLowerCase();
+    const filename = `jewel-${uniqueSuffix}${ext}`;
+    const filePath = path.resolve(uploadsDir, filename);
+
+    fs.writeFileSync(filePath, file.buffer);
+
+    return {
+      imageUrl: `/uploads/${filename}`,
+      publicId: filename,
+    };
+  } catch (fsErr) {
+    // 3. Fallback for serverless read-only filesystems (e.g. Vercel without Cloudinary)
+    console.warn('⚠️ Serverless or read-only filesystem detected. Storing image as data URI in DB:', fsErr.message);
+    const mime = file.mimetype || 'image/png';
+    const base64Data = file.buffer.toString('base64');
+    const dataUri = `data:${mime};base64,${base64Data}`;
+
+    return {
+      imageUrl: dataUri,
+      publicId: `data-uri-${Date.now()}`,
+    };
+  }
 };
 
 export const deleteImageFromStorage = async (publicId) => {
-  if (!publicId) return;
+  if (!publicId || publicId.startsWith('data-uri-')) return;
 
   if (isCloudinaryConfigured && !publicId.startsWith('jewel-')) {
     try {
@@ -97,13 +113,13 @@ export const deleteImageFromStorage = async (publicId) => {
     }
   } else {
     // Local deletion
-    const localPath = path.resolve(uploadsDir, publicId);
-    if (fs.existsSync(localPath)) {
-      try {
+    try {
+      const localPath = path.resolve(uploadsDir, publicId);
+      if (fs.existsSync(localPath)) {
         fs.unlinkSync(localPath);
-      } catch (err) {
-        console.error('Failed to delete local image:', err);
       }
+    } catch (err) {
+      console.error('Failed to delete local image:', err);
     }
   }
 };
